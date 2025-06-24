@@ -1,0 +1,19 @@
+# 为示例创建单独的 package
+[package]
+name = "stowr-examples"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+stowr-core = { path = "../stowr-core" }
+anyhow.workspace = true
+serde.workspace = true
+
+[[example]]
+name = "basic_usage"
+path = "basic_usage.rs"
+
+[[example]]
+name = "tauri_integration"
+path = "tauri_integration.rs"
