@@ -32,7 +32,7 @@ tempfile = "3.8"
 release = true
 # 发布到 crates.io
 publish = true
-# 自动推送 git 标签
+# 自动推送
 push = true
 # 发布后创建 git 标签
 tag = true
