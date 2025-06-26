@@ -43,7 +43,8 @@ impl StorageManager {
 
         // 生成唯一ID和存储路径
         let id = Uuid::new_v4().to_string();
-        let stored_filename = format!("{}.gz", id);
+        let extension = self.config.compression_algorithm.file_extension();
+        let stored_filename = format!("{}.{}", id, extension);
         let stored_path = self.config.storage_path.join(&stored_filename);
 
         // 确保存储目录存在
@@ -184,14 +185,26 @@ impl StorageManager {
     }
 
     fn compress_file(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
+        match self.config.compression_algorithm {
+            crate::config::CompressionAlgorithm::Gzip => {
+                self.compress_file_gzip(input_path, output_path)
+            }
+            crate::config::CompressionAlgorithm::Zstd => {
+                self.compress_file_zstd(input_path, output_path)
+            }
+            crate::config::CompressionAlgorithm::Lz4 => {
+                self.compress_file_lz4(input_path, output_path)
+            }
+        }
+    }
+
+    fn compress_file_gzip(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
         let mut input_file = File::open(input_path)
             .context("Failed to open input file")?;
         let output_file = File::create(output_path)
             .context("Failed to create output file")?;
 
-        // 使用配置中设置的压缩级别
         let compression_level = Compression::new(self.config.compression_level);
-
         let mut encoder = GzEncoder::new(output_file, compression_level);
         io::copy(&mut input_file, &mut encoder)
             .context("Failed to compress file")?;
@@ -203,7 +216,62 @@ impl StorageManager {
         Ok(compressed_size)
     }
 
+    fn compress_file_zstd(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
+        let input_data = fs::read(input_path)
+            .context("Failed to read input file")?;
+
+        let compressed_data = zstd::encode_all(
+            input_data.as_slice(),
+            self.config.compression_level as i32,
+        ).context("Failed to compress with zstd")?;
+
+        fs::write(output_path, compressed_data)
+            .context("Failed to write compressed file")?;
+
+        let compressed_size = fs::metadata(output_path)?.len();
+        Ok(compressed_size)
+    }
+
+    fn compress_file_lz4(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
+        let input_data = fs::read(input_path)
+            .context("Failed to read input file")?;
+
+        let compressed_data = lz4_flex::compress_prepend_size(&input_data);
+
+        fs::write(output_path, compressed_data)
+            .context("Failed to write compressed file")?;
+
+        let compressed_size = fs::metadata(output_path)?.len();
+        Ok(compressed_size)
+    }
+
     fn decompress_file(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+        // 根据文件扩展名确定压缩算法
+        let algorithm = if let Some(ext) = input_path.extension() {
+            match ext.to_str() {
+                Some("gz") => crate::config::CompressionAlgorithm::Gzip,
+                Some("zst") => crate::config::CompressionAlgorithm::Zstd,
+                Some("lz4") => crate::config::CompressionAlgorithm::Lz4,
+                _ => return Err(anyhow::anyhow!("Unsupported file extension: {:?}", ext)),
+            }
+        } else {
+            return Err(anyhow::anyhow!("No file extension found"));
+        };
+
+        match algorithm {
+            crate::config::CompressionAlgorithm::Gzip => {
+                self.decompress_file_gzip(input_path, output_path)
+            }
+            crate::config::CompressionAlgorithm::Zstd => {
+                self.decompress_file_zstd(input_path, output_path)
+            }
+            crate::config::CompressionAlgorithm::Lz4 => {
+                self.decompress_file_lz4(input_path, output_path)
+            }
+        }
+    }
+
+    fn decompress_file_gzip(&self, input_path: &Path, output_path: &Path) -> Result<()> {
         let input_file = File::open(input_path)
             .context("Failed to open compressed file")?;
         let mut decoder = GzDecoder::new(input_file);
@@ -219,6 +287,44 @@ impl StorageManager {
 
         io::copy(&mut decoder, &mut output_file)
             .context("Failed to decompress file")?;
+
+        Ok(())
+    }
+
+    fn decompress_file_zstd(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+        let compressed_data = fs::read(input_path)
+            .context("Failed to read compressed file")?;
+
+        let decompressed_data = zstd::decode_all(compressed_data.as_slice())
+            .context("Failed to decompress with zstd")?;
+
+        // 确保输出目录存在
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create output directory")?;
+        }
+
+        fs::write(output_path, decompressed_data)
+            .context("Failed to write decompressed file")?;
+
+        Ok(())
+    }
+
+    fn decompress_file_lz4(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+        let compressed_data = fs::read(input_path)
+            .context("Failed to read compressed file")?;
+
+        let decompressed_data = lz4_flex::decompress_size_prepended(&compressed_data)
+            .context("Failed to decompress with lz4")?;
+
+        // 确保输出目录存在
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create output directory")?;
+        }
+
+        fs::write(output_path, decompressed_data)
+            .context("Failed to write decompressed file")?;
 
         Ok(())
     }
@@ -614,7 +720,8 @@ impl StorageManager {
 
         // 生成唯一ID和存储路径
         let id = Uuid::new_v4().to_string();
-        let stored_filename = format!("{}.gz", id);
+        let extension = config.compression_algorithm.file_extension();
+        let stored_filename = format!("{}.{}", id, extension);
         let stored_path = config.storage_path.join(&stored_filename);
 
         // 确保存储目录存在
@@ -653,20 +760,61 @@ impl StorageManager {
 
     // 静态压缩文件方法
     fn compress_file_static(input_path: &Path, output_path: &Path, config: &Config) -> Result<u64> {
+        match config.compression_algorithm {
+            crate::config::CompressionAlgorithm::Gzip => {
+                Self::compress_file_gzip_static(input_path, output_path, config)
+            }
+            crate::config::CompressionAlgorithm::Zstd => {
+                Self::compress_file_zstd_static(input_path, output_path, config)
+            }
+            crate::config::CompressionAlgorithm::Lz4 => {
+                Self::compress_file_lz4_static(input_path, output_path, config)
+            }
+        }
+    }
+
+    fn compress_file_gzip_static(input_path: &Path, output_path: &Path, config: &Config) -> Result<u64> {
         let mut input_file = File::open(input_path)
             .context("Failed to open input file")?;
         let output_file = File::create(output_path)
             .context("Failed to create output file")?;
 
-        // 使用配置中设置的压缩级别
         let compression_level = Compression::new(config.compression_level);
-
         let mut encoder = GzEncoder::new(output_file, compression_level);
         io::copy(&mut input_file, &mut encoder)
             .context("Failed to compress file")?;
 
         encoder.finish()
             .context("Failed to finalize compression")?;
+
+        let compressed_size = fs::metadata(output_path)?.len();
+        Ok(compressed_size)
+    }
+
+    fn compress_file_zstd_static(input_path: &Path, output_path: &Path, config: &Config) -> Result<u64> {
+        let input_data = fs::read(input_path)
+            .context("Failed to read input file")?;
+
+        let compressed_data = zstd::encode_all(
+            input_data.as_slice(),
+            config.compression_level as i32,
+        ).context("Failed to compress with zstd")?;
+
+        fs::write(output_path, compressed_data)
+            .context("Failed to write compressed file")?;
+
+        let compressed_size = fs::metadata(output_path)?.len();
+        Ok(compressed_size)
+    }
+
+    fn compress_file_lz4_static(input_path: &Path, output_path: &Path, _config: &Config) -> Result<u64> {
+        let input_data = fs::read(input_path)
+            .context("Failed to read input file")?;
+
+        let compressed_data = lz4_flex::compress_prepend_size(&input_data);
+
+        fs::write(output_path, compressed_data)
+            .context("Failed to write compressed file")?;
 
         let compressed_size = fs::metadata(output_path)?.len();
         Ok(compressed_size)
@@ -730,6 +878,32 @@ impl StorageManager {
 
     // 静态解压文件方法
     fn decompress_file_static(input_path: &Path, output_path: &Path) -> Result<()> {
+        // 根据文件扩展名确定压缩算法
+        let algorithm = if let Some(ext) = input_path.extension() {
+            match ext.to_str() {
+                Some("gz") => crate::config::CompressionAlgorithm::Gzip,
+                Some("zst") => crate::config::CompressionAlgorithm::Zstd,
+                Some("lz4") => crate::config::CompressionAlgorithm::Lz4,
+                _ => return Err(anyhow::anyhow!("Unsupported file extension: {:?}", ext)),
+            }
+        } else {
+            return Err(anyhow::anyhow!("No file extension found"));
+        };
+
+        match algorithm {
+            crate::config::CompressionAlgorithm::Gzip => {
+                Self::decompress_file_gzip_static(input_path, output_path)
+            }
+            crate::config::CompressionAlgorithm::Zstd => {
+                Self::decompress_file_zstd_static(input_path, output_path)
+            }
+            crate::config::CompressionAlgorithm::Lz4 => {
+                Self::decompress_file_lz4_static(input_path, output_path)
+            }
+        }
+    }
+
+    fn decompress_file_gzip_static(input_path: &Path, output_path: &Path) -> Result<()> {
         let input_file = File::open(input_path)
             .context("Failed to open compressed file")?;
         let mut decoder = GzDecoder::new(input_file);
@@ -745,6 +919,44 @@ impl StorageManager {
 
         io::copy(&mut decoder, &mut output_file)
             .context("Failed to decompress file")?;
+
+        Ok(())
+    }
+
+    fn decompress_file_zstd_static(input_path: &Path, output_path: &Path) -> Result<()> {
+        let compressed_data = fs::read(input_path)
+            .context("Failed to read compressed file")?;
+
+        let decompressed_data = zstd::decode_all(compressed_data.as_slice())
+            .context("Failed to decompress with zstd")?;
+
+        // 确保输出目录存在
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create output directory")?;
+        }
+
+        fs::write(output_path, decompressed_data)
+            .context("Failed to write decompressed file")?;
+
+        Ok(())
+    }
+
+    fn decompress_file_lz4_static(input_path: &Path, output_path: &Path) -> Result<()> {
+        let compressed_data = fs::read(input_path)
+            .context("Failed to read compressed file")?;
+
+        let decompressed_data = lz4_flex::decompress_size_prepended(&compressed_data)
+            .context("Failed to decompress with lz4")?;
+
+        // 确保输出目录存在
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create output directory")?;
+        }
+
+        fs::write(output_path, decompressed_data)
+            .context("Failed to write decompressed file")?;
 
         Ok(())
     }

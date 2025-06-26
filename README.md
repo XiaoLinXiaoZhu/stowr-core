@@ -19,11 +19,15 @@ STOWR是一个由“Store”和“Owe”,两个单词组合而成的名称。它
 
 ## 功能特性
 
-- **文件压缩存储**: 使用 gzip 压缩算法减少存储空间
+- **多种压缩算法**: 支持 gzip（默认）、zstd、lz4 压缩算法，可根据需求选择
+- **灵活压缩级别**: 每种算法支持不同的压缩级别配置
+  - gzip: 0-9（默认6）
+  - zstd: 1-22（默认3）
+  - lz4: 无级别配置（专注于速度）
 - **双重索引系统**: 支持 JSON 和 SQLite 两种索引模式，自动选择最优方案
 - **批量文件操作**: 支持通配符模式批量处理文件
 - **多线程支持**: 并行处理大量文件，提升性能
-- **灵活配置**: 可配置压缩级别、存储路径、索引模式等
+- **灵活配置**: 可配置压缩算法、压缩级别、存储路径、索引模式等
 - **模块化设计**: 易于集成到不同类型的应用程序中
 
 ## 快速开始
@@ -76,14 +80,42 @@ fn main() -> anyhow::Result<()> {
 ### 配置选项
 
 ```rust
-use stowr_core::{Config, IndexMode};
+use stowr_core::{Config, IndexMode, CompressionAlgorithm};
 use std::path::PathBuf;
 
 let mut config = Config::default();
 config.storage_path = PathBuf::from("./my_storage");
 config.index_mode = IndexMode::Sqlite;  // 强制使用 SQLite 索引
-config.compression_level = 9;           // 最高压缩级别
+config.compression_algorithm = CompressionAlgorithm::Zstd;  // 使用 zstd 压缩
+config.compression_level = 15;          // zstd 高压缩级别
 config.multithread = 4;                 // 使用 4 个线程
+```
+
+### 压缩算法选择
+
+不同的压缩算法适用于不同的场景：
+
+- **gzip**: 通用性好，压缩率中等，速度中等（默认）
+- **zstd**: 压缩率高，速度快，现代推荐选择
+- **lz4**: 压缩速度极快，压缩率较低，适合实时处理
+
+```rust
+use stowr_core::{Config, CompressionAlgorithm};
+
+// 使用不同的压缩算法
+let mut config = Config::default();
+
+// 高压缩率场景
+config.compression_algorithm = CompressionAlgorithm::Zstd;
+config.compression_level = 20;
+
+// 高速度场景
+config.compression_algorithm = CompressionAlgorithm::Lz4;
+// lz4 无需设置压缩级别
+
+// 兼容性场景
+config.compression_algorithm = CompressionAlgorithm::Gzip;
+config.compression_level = 6;
 ```
 
 ## 高级功能
@@ -168,7 +200,10 @@ impl FileService {
 
 ## 性能考虑
 
-- 默认压缩级别为 6，在压缩率和速度之间取得平衡
+- **压缩算法选择**: 根据使用场景选择合适的压缩算法
+  - gzip: 平衡的压缩率和速度，默认级别6
+  - zstd: 现代高效算法，推荐用于新项目，默认级别3
+  - lz4: 极速压缩，适合实时或临时存储
 - 多线程处理在文件数量 > 1 且线程数 > 1 时自动启用
 - SQLite 索引在大量文件时性能更好
 - 内存使用量与并发线程数成正比
