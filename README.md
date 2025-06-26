@@ -24,10 +24,12 @@ STOWR是一个由“Store”和“Owe”,两个单词组合而成的名称。它
   - gzip: 0-9（默认6）
   - zstd: 1-22（默认3）
   - lz4: 无级别配置（专注于速度）
+- **智能去重存储**: 自动检测重复文件，通过内容哈希实现零冗余存储
+- **差分压缩技术**: 对相似文件使用差分存储，大幅减少存储空间占用
 - **双重索引系统**: 支持 JSON 和 SQLite 两种索引模式，自动选择最优方案
 - **批量文件操作**: 支持通配符模式批量处理文件
 - **多线程支持**: 并行处理大量文件，提升性能
-- **灵活配置**: 可配置压缩算法、压缩级别、存储路径、索引模式等
+- **灵活配置**: 可配置压缩算法、压缩级别、存储路径、索引模式、去重和差分策略等
 - **模块化设计**: 易于集成到不同类型的应用程序中
 
 ## 快速开始
@@ -80,7 +82,7 @@ fn main() -> anyhow::Result<()> {
 ### 配置选项
 
 ```rust
-use stowr_core::{Config, IndexMode, CompressionAlgorithm};
+use stowr_core::{Config, IndexMode, CompressionAlgorithm, DeltaAlgorithm};
 use std::path::PathBuf;
 
 let mut config = Config::default();
@@ -89,7 +91,49 @@ config.index_mode = IndexMode::Sqlite;  // 强制使用 SQLite 索引
 config.compression_algorithm = CompressionAlgorithm::Zstd;  // 使用 zstd 压缩
 config.compression_level = 15;          // zstd 高压缩级别
 config.multithread = 4;                 // 使用 4 个线程
+
+// 去重和差分配置
+config.enable_deduplication = true;     // 启用内容去重
+config.enable_delta_compression = true; // 启用差分压缩
+config.similarity_threshold = 0.8;      // 80% 相似度阈值
+config.delta_algorithm = DeltaAlgorithm::Simple; // 差分算法
 ```
+
+### 去重和差分存储
+
+STOWR 提供强大的去重和差分存储功能，特别适合存储大量相似文件：
+
+```rust
+use stowr_core::{Config, StorageManager, create_index, DeltaAlgorithm};
+
+// 配置去重和差分功能
+let mut config = Config::default();
+config.enable_deduplication = true;     // 启用内容去重
+config.enable_delta_compression = true; // 启用差分压缩
+config.similarity_threshold = 0.7;      // 70% 相似度阈值
+
+let index = create_index(&config)?;
+let mut storage = StorageManager::new(config, index);
+
+// 存储文件 - 自动检测重复和相似文件
+storage.store_file(Path::new("texture_v1.png"), false)?;
+storage.store_file(Path::new("texture_v2.png"), false)?; // 可能被差分存储
+storage.store_file(Path::new("texture_v1_copy.png"), false)?; // 可能被去重
+```
+
+#### 去重功能特点
+
+- **内容哈希**: 使用 SHA256 计算文件内容哈希
+- **零冗余**: 完全相同的文件只存储一份
+- **引用计数**: 自动管理文件引用，安全删除
+- **透明操作**: 对用户完全透明，无需额外操作
+
+#### 差分压缩特点
+
+- **相似度检测**: 智能检测文件间的相似性
+- **多种算法**: 支持简单差分、xdelta、bsdiff 等算法
+- **类型优先**: 优先与相同类型文件进行差分
+- **空间节省**: 大幅减少相似文件的存储空间
 
 ### 压缩算法选择
 

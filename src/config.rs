@@ -2,12 +2,29 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CompressionAlgorithm {
     Gzip,
     Zstd,
     Lz4,
+}
+
+impl FromStr for CompressionAlgorithm {
+    type Err = anyhow::Error;
+    
+    fn from_str(s: &str) -> Result<Self> {
+        Self::from_str(s)
+    }
+}
+
+impl FromStr for DeltaAlgorithm {
+    type Err = anyhow::Error;
+    
+    fn from_str(s: &str) -> Result<Self> {
+        Self::from_str(s)
+    }
 }
 
 impl Default for CompressionAlgorithm {
@@ -74,6 +91,38 @@ impl CompressionAlgorithm {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum DeltaAlgorithm {
+    Simple,    // 简单差分
+    XDelta,    // xdelta3 算法
+    BsDiff,    // bsdiff 算法
+}
+
+impl Default for DeltaAlgorithm {
+    fn default() -> Self {
+        DeltaAlgorithm::Simple
+    }
+}
+
+impl DeltaAlgorithm {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "simple" => Ok(DeltaAlgorithm::Simple),
+            "xdelta" => Ok(DeltaAlgorithm::XDelta),
+            "bsdiff" => Ok(DeltaAlgorithm::BsDiff),
+            _ => Err(anyhow::anyhow!("Invalid delta algorithm. Valid values: simple, xdelta, bsdiff")),
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            DeltaAlgorithm::Simple => "simple".to_string(),
+            DeltaAlgorithm::XDelta => "xdelta".to_string(),
+            DeltaAlgorithm::BsDiff => "bsdiff".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub storage_path: PathBuf,
@@ -84,6 +133,14 @@ pub struct Config {
     pub compression_algorithm: CompressionAlgorithm,
     #[serde(default = "default_compression_level")]
     pub compression_level: u32,
+    #[serde(default = "default_enable_deduplication")]
+    pub enable_deduplication: bool,
+    #[serde(default = "default_enable_delta_compression")]
+    pub enable_delta_compression: bool,
+    #[serde(default = "default_similarity_threshold")]
+    pub similarity_threshold: f32,
+    #[serde(default = "default_delta_algorithm")]
+    pub delta_algorithm: DeltaAlgorithm,
 }
 
 fn default_multithread() -> usize {
@@ -96,6 +153,22 @@ fn default_compression_algorithm() -> CompressionAlgorithm {
 
 fn default_compression_level() -> u32 {
     6  // gzip 的默认压缩级别
+}
+
+fn default_enable_deduplication() -> bool {
+    true
+}
+
+fn default_enable_delta_compression() -> bool {
+    false
+}
+
+fn default_similarity_threshold() -> f32 {
+    0.7  // 70% 相似度阈值
+}
+
+fn default_delta_algorithm() -> DeltaAlgorithm {
+    DeltaAlgorithm::Simple
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +186,10 @@ impl Default for Config {
             multithread: 1,
             compression_algorithm: CompressionAlgorithm::Gzip,
             compression_level: 6,
+            enable_deduplication: true,
+            enable_delta_compression: false,
+            similarity_threshold: 0.7,
+            delta_algorithm: DeltaAlgorithm::Simple,
         }
     }
 }
@@ -197,6 +274,25 @@ impl Config {
                     self.compression_level = self.compression_algorithm.validate_level(level)?;
                 }
             }
+            "dedup.enable" => {
+                self.enable_deduplication = value.parse::<bool>()
+                    .map_err(|_| anyhow::anyhow!("Invalid boolean value. Must be true or false"))?;
+            }
+            "delta.enable" => {
+                self.enable_delta_compression = value.parse::<bool>()
+                    .map_err(|_| anyhow::anyhow!("Invalid boolean value. Must be true or false"))?;
+            }
+            "delta.similarity_threshold" => {
+                let threshold = value.parse::<f32>()
+                    .map_err(|_| anyhow::anyhow!("Invalid similarity threshold. Must be a number between 0.0 and 1.0"))?;
+                if threshold < 0.0 || threshold > 1.0 {
+                    return Err(anyhow::anyhow!("Similarity threshold must be between 0.0 and 1.0"));
+                }
+                self.similarity_threshold = threshold;
+            }
+            "delta.algorithm" => {
+                self.delta_algorithm = DeltaAlgorithm::from_str(value)?;
+            }
             _ => return Err(anyhow::anyhow!("Unknown config key: {}", key)),
         }
         Ok(())
@@ -209,6 +305,10 @@ impl Config {
             ("multithread".to_string(), self.multithread.to_string()),
             ("compression.algorithm".to_string(), self.compression_algorithm.to_string()),
             ("compression.level".to_string(), self.compression_level.to_string()),
+            ("dedup.enable".to_string(), self.enable_deduplication.to_string()),
+            ("delta.enable".to_string(), self.enable_delta_compression.to_string()),
+            ("delta.similarity_threshold".to_string(), self.similarity_threshold.to_string()),
+            ("delta.algorithm".to_string(), self.delta_algorithm.to_string()),
         ]
     }
 }

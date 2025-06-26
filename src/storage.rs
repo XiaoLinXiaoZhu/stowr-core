@@ -10,15 +10,37 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::index::{FileEntry, IndexStore};
+use crate::dedup::ContentDeduplicator;
+use crate::delta::DeltaStorage;
 
 pub struct StorageManager {
     config: Config,
     index: Box<dyn IndexStore>,
+    deduplicator: ContentDeduplicator,
+    delta_storage: DeltaStorage,
 }
 
 impl StorageManager {
     pub fn new(config: Config, index: Box<dyn IndexStore>) -> Self {
-        Self { config, index }
+        let deduplicator = ContentDeduplicator::new();
+        let delta_storage = DeltaStorage::new(
+            config.similarity_threshold,
+            config.delta_algorithm.clone(),
+        );
+
+        let mut manager = Self {
+            config,
+            index,
+            deduplicator,
+            delta_storage,
+        };
+
+        // 从现有索引重建去重器状态
+        if let Err(e) = manager.rebuild_dedup_state() {
+            eprintln!("Warning: Failed to rebuild deduplication state: {}", e);
+        }
+
+        manager
     }
 
     pub fn store_file(&mut self, file_path: &Path, delete_source: bool) -> Result<()> {
@@ -30,7 +52,7 @@ impl StorageManager {
             return Err(anyhow::anyhow!("Path is not a file: {}", file_path.display()));
         }
 
-        // 检查文件是否已经存储
+        // 检查文件路径是否已经存储（防止重复存储同一路径）
         if self.index.get_file(file_path)?.is_some() {
             println!("File already stored: {}", file_path.display());
             if delete_source {
@@ -41,62 +63,79 @@ impl StorageManager {
             return Ok(());
         }
 
-        // 生成唯一ID和存储路径
-        let id = Uuid::new_v4().to_string();
-        let extension = self.config.compression_algorithm.file_extension();
-        let stored_filename = format!("{}.{}", id, extension);
-        let stored_path = self.config.storage_path.join(&stored_filename);
+        // 计算文件哈希进行内容去重
+        let file_content = fs::read(file_path)
+            .context("Failed to read file for hashing")?;
+        let file_hash = ContentDeduplicator::calculate_hash(&file_content);
 
-        // 确保存储目录存在
-        fs::create_dir_all(&self.config.storage_path)
-            .context("Failed to create storage directory")?;
-
-        // 获取原始文件大小
-        let file_size = fs::metadata(file_path)?.len();
-
-        // 压缩并存储文件
-        let compressed_size = self.compress_file(file_path, &stored_path)
-            .context("Failed to compress file")?;
-
-        // 创建索引条目
-        let entry = FileEntry {
-            id,
-            original_path: file_path.to_path_buf(),
-            stored_path,
-            file_size,
-            compressed_size,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        // 添加到索引
-        self.index.add_file(entry)
-            .context("Failed to add file to index")?;
-
-        // 如果需要删除源文件
-        if delete_source {
-            fs::remove_file(file_path)
-                .context("Failed to delete source file")?;
-            println!("Source file deleted: {}", file_path.display());
+        // 检查是否启用去重功能
+        if self.config.enable_deduplication {
+            if let Some(existing_entry) = self.find_file_by_hash(&file_hash)? {
+                // 文件内容完全相同，创建引用
+                let entry = self.create_reference_entry(file_path, &existing_entry)?;
+                self.index.add_file(entry)?;
+                
+                // 增加去重器中的引用计数
+                self.deduplicator.add_hash_reference(&file_hash, &existing_entry.id);
+                
+                if delete_source {
+                    fs::remove_file(file_path)
+                        .context("Failed to delete source file")?;
+                    println!("Source file deleted: {}", file_path.display());
+                }
+                
+                println!("File deduplicated (reference created): {}", file_path.display());
+                println!("References existing file with hash: {}", file_hash);
+                return Ok(());
+            }
         }
 
-        println!("File stored successfully: {}", file_path.display());
-        println!("Compression ratio: {:.1}%", 
-                 (compressed_size as f64 / file_size as f64) * 100.0);
+        // 检查是否启用差分存储
+        if self.config.enable_delta_compression {
+            if let Some((base_entry, similarity)) = self.find_similar_file(&file_content)? {
+                if similarity >= self.config.similarity_threshold {
+                    // 创建差分文件
+                    return self.store_as_delta(file_path, &file_content, &base_entry, similarity, delete_source);
+                }
+            }
+        }
 
-        Ok(())
+        // 作为新的基础文件存储
+        self.store_as_base_file(file_path, &file_content, file_hash, delete_source)
     }
 
     pub fn owe_file(&mut self, file_path: &Path) -> Result<()> {
         let entry = self.index.get_file(file_path)?
             .ok_or_else(|| anyhow::anyhow!("File not found in storage: {}", file_path.display()))?;
 
-        // 解压文件到原始位置
-        self.decompress_file(&entry.stored_path, &entry.original_path)
-            .context("Failed to decompress file")?;
-
-        // 删除压缩的存储文件
-        fs::remove_file(&entry.stored_path)
-            .context("Failed to remove stored file")?;
+        // 根据文件类型处理不同的提取逻辑
+        if entry.is_reference.unwrap_or(false) {
+            // 引用文件：从原始存储位置提取内容
+            self.extract_reference_file(&entry)?;
+        } else if entry.is_delta.unwrap_or(false) {
+            // 差分文件：重建原文件
+            self.extract_delta_file(&entry)?;
+        } else {
+            // 基础文件：直接解压缩
+            self.decompress_file(&entry.stored_path, &entry.original_path)
+                .context("Failed to decompress file")?;
+            
+            // 对于基础文件，也需要处理引用计数
+            let should_delete_from_dedup = if let Some(hash) = &entry.hash {
+                self.deduplicator.remove_hash_reference(hash)
+            } else {
+                true // 如果没有哈希值，说明不是去重文件，可以删除
+            };
+            
+            // 检查是否还有其他引用
+            let has_references = self.has_references_to_storage(&entry.id)?;
+            
+            // 只有当去重器认为可以删除且没有其他引用时才删除存储文件
+            if should_delete_from_dedup && !has_references && entry.stored_path.exists() {
+                fs::remove_file(&entry.stored_path)
+                    .context("Failed to remove stored file")?;
+            }
+        }
 
         // 从索引中移除
         self.index.remove_file(file_path)?;
@@ -182,67 +221,6 @@ impl StorageManager {
 
         println!("File deleted from storage: {}", file_path.display());
         Ok(())
-    }
-
-    fn compress_file(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
-        match self.config.compression_algorithm {
-            crate::config::CompressionAlgorithm::Gzip => {
-                self.compress_file_gzip(input_path, output_path)
-            }
-            crate::config::CompressionAlgorithm::Zstd => {
-                self.compress_file_zstd(input_path, output_path)
-            }
-            crate::config::CompressionAlgorithm::Lz4 => {
-                self.compress_file_lz4(input_path, output_path)
-            }
-        }
-    }
-
-    fn compress_file_gzip(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
-        let mut input_file = File::open(input_path)
-            .context("Failed to open input file")?;
-        let output_file = File::create(output_path)
-            .context("Failed to create output file")?;
-
-        let compression_level = Compression::new(self.config.compression_level);
-        let mut encoder = GzEncoder::new(output_file, compression_level);
-        io::copy(&mut input_file, &mut encoder)
-            .context("Failed to compress file")?;
-
-        encoder.finish()
-            .context("Failed to finalize compression")?;
-
-        let compressed_size = fs::metadata(output_path)?.len();
-        Ok(compressed_size)
-    }
-
-    fn compress_file_zstd(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
-        let input_data = fs::read(input_path)
-            .context("Failed to read input file")?;
-
-        let compressed_data = zstd::encode_all(
-            input_data.as_slice(),
-            self.config.compression_level as i32,
-        ).context("Failed to compress with zstd")?;
-
-        fs::write(output_path, compressed_data)
-            .context("Failed to write compressed file")?;
-
-        let compressed_size = fs::metadata(output_path)?.len();
-        Ok(compressed_size)
-    }
-
-    fn compress_file_lz4(&self, input_path: &Path, output_path: &Path) -> Result<u64> {
-        let input_data = fs::read(input_path)
-            .context("Failed to read input file")?;
-
-        let compressed_data = lz4_flex::compress_prepend_size(&input_data);
-
-        fs::write(output_path, compressed_data)
-            .context("Failed to write compressed file")?;
-
-        let compressed_size = fs::metadata(output_path)?.len();
-        Ok(compressed_size)
     }
 
     fn decompress_file(&self, input_path: &Path, output_path: &Path) -> Result<()> {
@@ -670,154 +648,24 @@ impl StorageManager {
 
     // 多线程存储文件
     fn store_files_parallel(&mut self, files: Vec<PathBuf>, delete_source: bool) -> Result<()> {
-        use rayon::prelude::*;
+        // 对于去重和差分存储，我们需要顺序处理以正确比较文件
+        // 多线程会破坏去重和差分存储的逻辑，因为需要访问共享的索引和去重器状态
+        println!("Processing {} files sequentially to enable deduplication and delta compression...", files.len());
         
-        // 设置全局线程池
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(self.config.multithread)
-            .build_global()
-            .unwrap_or_else(|_| {
-                // 如果全局线程池已存在，继续使用
-            });
-
-        let config = self.config.clone();
-        
-        // 并行处理文件
-        let results: Vec<Result<FileEntry>> = files
-            .par_iter()
-            .map(|file_path| {
-                Self::process_single_file_static(file_path, delete_source, &config)
-            })
-            .collect();
-
-        // 批量添加到索引
         let mut success_count = 0;
-        for result in results {
-            match result {
-                Ok(entry) => {
-                    self.index.add_file(entry)?;
+        for file_path in files {
+            match self.store_file(&file_path, delete_source) {
+                Ok(()) => {
                     success_count += 1;
                 }
                 Err(e) => {
-                    eprintln!("Failed to store file: {}", e);
+                    eprintln!("Failed to store {}: {}", file_path.display(), e);
                 }
             }
         }
 
-        println!("Stored {} files using {} threads", success_count, self.config.multithread);
+        println!("Stored {} files with deduplication and delta compression enabled", success_count);
         Ok(())
-    }
-
-    // 静态方法处理单个文件存储（用于多线程）
-    fn process_single_file_static(file_path: &Path, delete_source: bool, config: &Config) -> Result<FileEntry> {
-        if !file_path.exists() {
-            return Err(anyhow::anyhow!("File does not exist: {}", file_path.display()));
-        }
-
-        if !file_path.is_file() {
-            return Err(anyhow::anyhow!("Path is not a file: {}", file_path.display()));
-        }
-
-        // 生成唯一ID和存储路径
-        let id = Uuid::new_v4().to_string();
-        let extension = config.compression_algorithm.file_extension();
-        let stored_filename = format!("{}.{}", id, extension);
-        let stored_path = config.storage_path.join(&stored_filename);
-
-        // 确保存储目录存在
-        fs::create_dir_all(&config.storage_path)
-            .context("Failed to create storage directory")?;
-
-        // 获取原始文件大小
-        let file_size = fs::metadata(file_path)?.len();
-
-        // 压缩并存储文件
-        let compressed_size = Self::compress_file_static(file_path, &stored_path, config)
-            .context("Failed to compress file")?;
-
-        // 如果需要删除源文件
-        if delete_source {
-            fs::remove_file(file_path)
-                .context("Failed to delete source file")?;
-        }
-
-        // 创建索引条目
-        let entry = FileEntry {
-            id,
-            original_path: file_path.to_path_buf(),
-            stored_path,
-            file_size,
-            compressed_size,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        println!("File stored successfully: {} (compression: {:.1}%)", 
-                 file_path.display(),
-                 (compressed_size as f64 / file_size as f64) * 100.0);
-
-        Ok(entry)
-    }
-
-    // 静态压缩文件方法
-    fn compress_file_static(input_path: &Path, output_path: &Path, config: &Config) -> Result<u64> {
-        match config.compression_algorithm {
-            crate::config::CompressionAlgorithm::Gzip => {
-                Self::compress_file_gzip_static(input_path, output_path, config)
-            }
-            crate::config::CompressionAlgorithm::Zstd => {
-                Self::compress_file_zstd_static(input_path, output_path, config)
-            }
-            crate::config::CompressionAlgorithm::Lz4 => {
-                Self::compress_file_lz4_static(input_path, output_path, config)
-            }
-        }
-    }
-
-    fn compress_file_gzip_static(input_path: &Path, output_path: &Path, config: &Config) -> Result<u64> {
-        let mut input_file = File::open(input_path)
-            .context("Failed to open input file")?;
-        let output_file = File::create(output_path)
-            .context("Failed to create output file")?;
-
-        let compression_level = Compression::new(config.compression_level);
-        let mut encoder = GzEncoder::new(output_file, compression_level);
-        io::copy(&mut input_file, &mut encoder)
-            .context("Failed to compress file")?;
-
-        encoder.finish()
-            .context("Failed to finalize compression")?;
-
-        let compressed_size = fs::metadata(output_path)?.len();
-        Ok(compressed_size)
-    }
-
-    fn compress_file_zstd_static(input_path: &Path, output_path: &Path, config: &Config) -> Result<u64> {
-        let input_data = fs::read(input_path)
-            .context("Failed to read input file")?;
-
-        let compressed_data = zstd::encode_all(
-            input_data.as_slice(),
-            config.compression_level as i32,
-        ).context("Failed to compress with zstd")?;
-
-        fs::write(output_path, compressed_data)
-            .context("Failed to write compressed file")?;
-
-        let compressed_size = fs::metadata(output_path)?.len();
-        Ok(compressed_size)
-    }
-
-    fn compress_file_lz4_static(input_path: &Path, output_path: &Path, _config: &Config) -> Result<u64> {
-        let input_data = fs::read(input_path)
-            .context("Failed to read input file")?;
-
-        let compressed_data = lz4_flex::compress_prepend_size(&input_data);
-
-        fs::write(output_path, compressed_data)
-            .context("Failed to write compressed file")?;
-
-        let compressed_size = fs::metadata(output_path)?.len();
-        Ok(compressed_size)
     }
 
     // 多线程提取文件
@@ -959,5 +807,446 @@ impl StorageManager {
             .context("Failed to write decompressed file")?;
 
         Ok(())
+    }
+
+    /// 获取去重统计信息
+    pub fn get_dedup_stats(&self) -> crate::dedup::DedupStats {
+        self.deduplicator.get_stats()
+    }
+
+    /// 获取差分存储统计信息
+    pub fn get_delta_stats(&self) -> crate::delta::DeltaStats {
+        self.delta_storage.get_stats()
+    }
+
+    /// 检查是否启用去重功能
+    pub fn is_dedup_enabled(&self) -> bool {
+        self.config.enable_deduplication
+    }
+
+    /// 检查是否启用差分存储功能
+    pub fn is_delta_enabled(&self) -> bool {
+        self.config.enable_delta_compression
+    }
+
+    /// 获取当前相似度阈值
+    pub fn get_similarity_threshold(&self) -> f32 {
+        self.config.similarity_threshold
+    }
+
+    /// 根据哈希值查找基础文件（用于去重）
+    fn find_file_by_hash(&self, hash: &str) -> Result<Option<FileEntry>> {
+        let all_files = self.index.list_files()?;
+        for file in all_files {
+            if let Some(file_hash) = &file.hash {
+                if file_hash == hash {
+                    // 只返回基础文件（非引用、非差分文件）
+                    if !file.is_reference.unwrap_or(false) && !file.is_delta.unwrap_or(false) {
+                        return Ok(Some(file));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 查找相似文件用于差分存储
+    fn find_similar_file(&self, content: &[u8]) -> Result<Option<(FileEntry, f32)>> {
+        let all_files = self.index.list_files()?;
+        let mut best_match: Option<(FileEntry, f32)> = None;
+
+        for file in all_files {
+            // 只考虑基础文件（非引用、非差分文件）
+            if file.is_reference.unwrap_or(false) || file.is_delta.unwrap_or(false) {
+                continue;
+            }
+
+            // 读取已存储的文件内容进行比较
+            if let Ok(stored_content) = self.read_stored_file_content(&file) {
+                let similarity = self.delta_storage.calculate_similarity(content, &stored_content);
+                
+                if let Some((_, current_best)) = &best_match {
+                    if similarity > *current_best {
+                        best_match = Some((file, similarity));
+                    }
+                } else {
+                    best_match = Some((file, similarity));
+                }
+            }
+        }
+
+        Ok(best_match)
+    }
+
+    /// 读取已存储文件的内容
+    fn read_stored_file_content(&self, entry: &FileEntry) -> Result<Vec<u8>> {
+        // 先解压缩文件到临时位置，然后读取内容
+        let compressed_data = fs::read(&entry.stored_path)
+            .context("Failed to read stored file")?;
+
+        match entry.compression_algorithm {
+            crate::config::CompressionAlgorithm::Gzip => {
+                let mut decoder = GzDecoder::new(compressed_data.as_slice());
+                let mut content = Vec::new();
+                std::io::Read::read_to_end(&mut decoder, &mut content)
+                    .context("Failed to decompress gzip file")?;
+                Ok(content)
+            }
+            crate::config::CompressionAlgorithm::Zstd => {
+                zstd::decode_all(compressed_data.as_slice())
+                    .context("Failed to decompress zstd file")
+            }
+            crate::config::CompressionAlgorithm::Lz4 => {
+                lz4_flex::decompress_size_prepended(&compressed_data)
+                    .context("Failed to decompress lz4 file")
+            }
+        }
+    }
+
+    /// 创建引用条目（用于去重）
+    fn create_reference_entry(&self, file_path: &Path, existing_entry: &FileEntry) -> Result<FileEntry> {
+        let id = Uuid::new_v4().to_string();
+        let mut entry = FileEntry::new(
+            id,
+            file_path.to_path_buf(),
+            existing_entry.stored_path.clone(), // 引用同样的存储路径
+            existing_entry.file_size,
+            0, // 引用文件的压缩大小为0
+            existing_entry.compression_algorithm.clone(),
+        );
+
+        // 设置引用相关字段
+        entry.is_reference = Some(true);
+        entry.base_storage_id = Some(existing_entry.id.clone());
+        entry.hash = existing_entry.hash.clone();
+
+        Ok(entry)
+    }
+
+    /// 存储为差分文件
+    fn store_as_delta(
+        &mut self,
+        file_path: &Path,
+        content: &[u8],
+        base_entry: &FileEntry,
+        similarity: f32,
+        delete_source: bool,
+    ) -> Result<()> {
+        // 读取基础文件内容
+        let base_content = self.read_stored_file_content(base_entry)?;
+
+        // 创建差分数据
+        let delta_data = self.delta_storage.create_delta(&base_content, content)?;
+
+        // 生成存储ID和路径
+        let id = Uuid::new_v4().to_string();
+        let extension = self.config.compression_algorithm.file_extension();
+        let stored_filename = format!("{}.{}", id, extension);
+        let stored_path = self.config.storage_path.join(&stored_filename);
+
+        // 确保存储目录存在
+        fs::create_dir_all(&self.config.storage_path)
+            .context("Failed to create storage directory")?;
+
+        // 压缩并存储差分数据
+        let compressed_size = self.compress_data(&delta_data, &stored_path)
+            .context("Failed to compress delta data")?;
+
+        // 创建索引条目
+        let mut entry = FileEntry::new(
+            id,
+            file_path.to_path_buf(),
+            stored_path,
+            content.len() as u64,
+            compressed_size,
+            self.config.compression_algorithm.clone(),
+        );
+
+        // 设置差分相关字段
+        entry.is_delta = Some(true);
+        entry.base_storage_id = Some(base_entry.id.clone());
+        entry.similarity_score = Some(similarity);
+        entry.hash = Some(ContentDeduplicator::calculate_hash(content));
+
+        // 添加到索引
+        self.index.add_file(entry)
+            .context("Failed to add delta file to index")?;
+
+        // 删除源文件（如果需要）
+        if delete_source {
+            fs::remove_file(file_path)
+                .context("Failed to delete source file")?;
+            println!("Source file deleted: {}", file_path.display());
+        }
+
+        println!("File stored as delta: {}", file_path.display());
+        println!("Similarity: {:.1}%, Delta size: {:.1}%", 
+                 similarity * 100.0,
+                 (compressed_size as f64 / content.len() as f64) * 100.0);
+
+        Ok(())
+    }
+
+    /// 存储为基础文件
+    fn store_as_base_file(
+        &mut self,
+        file_path: &Path,
+        content: &[u8],
+        hash: String,
+        delete_source: bool,
+    ) -> Result<()> {
+        // 生成唯一ID和存储路径
+        let id = Uuid::new_v4().to_string();
+        let extension = self.config.compression_algorithm.file_extension();
+        let stored_filename = format!("{}.{}", id, extension);
+        let stored_path = self.config.storage_path.join(&stored_filename);
+
+        // 确保存储目录存在
+        fs::create_dir_all(&self.config.storage_path)
+            .context("Failed to create storage directory")?;
+
+        // 压缩并存储文件
+        let compressed_size = self.compress_data(content, &stored_path)
+            .context("Failed to compress file")?;
+
+        // 创建索引条目
+        let mut entry = FileEntry::new(
+            id.clone(),
+            file_path.to_path_buf(),
+            stored_path,
+            content.len() as u64,
+            compressed_size,
+            self.config.compression_algorithm.clone(),
+        );
+
+        // 设置哈希值
+        entry.hash = Some(hash.clone());
+
+        // 注册到去重器（如果启用）
+        if self.config.enable_deduplication {
+            self.deduplicator.register_file(hash, id);
+        }
+
+        // 添加到索引
+        self.index.add_file(entry)
+            .context("Failed to add file to index")?;
+
+        // 删除源文件（如果需要）
+        if delete_source {
+            fs::remove_file(file_path)
+                .context("Failed to delete source file")?;
+            println!("Source file deleted: {}", file_path.display());
+        }
+
+        println!("File stored successfully: {}", file_path.display());
+        println!("Compression ratio: {:.1}%", 
+                 (compressed_size as f64 / content.len() as f64) * 100.0);
+
+        Ok(())
+    }
+
+    /// 压缩数据到指定路径
+    fn compress_data(&self, data: &[u8], output_path: &Path) -> Result<u64> {
+        match self.config.compression_algorithm {
+            crate::config::CompressionAlgorithm::Gzip => {
+                let output_file = File::create(output_path)
+                    .context("Failed to create output file")?;
+                let mut encoder = GzEncoder::new(output_file, Compression::new(self.config.compression_level as u32));
+                std::io::Write::write_all(&mut encoder, data)
+                    .context("Failed to write compressed data")?;
+                encoder.finish()
+                    .context("Failed to finish compression")?;
+                
+                Ok(fs::metadata(output_path)?.len())
+            }
+            crate::config::CompressionAlgorithm::Zstd => {
+                let compressed_data = zstd::encode_all(data, self.config.compression_level as i32)
+                    .context("Failed to compress with zstd")?;
+                fs::write(output_path, &compressed_data)
+                    .context("Failed to write compressed file")?;
+                
+                Ok(compressed_data.len() as u64)
+            }
+            crate::config::CompressionAlgorithm::Lz4 => {
+                let compressed_data = lz4_flex::compress_prepend_size(data);
+                fs::write(output_path, &compressed_data)
+                    .context("Failed to write compressed file")?;
+                
+                Ok(compressed_data.len() as u64)
+            }
+        }
+    }
+
+    /// 提取引用文件
+    fn extract_reference_file(&mut self, entry: &FileEntry) -> Result<()> {
+        // 引用文件的stored_path指向原始存储文件
+        // 直接解压缩到目标位置
+        self.decompress_file(&entry.stored_path, &entry.original_path)
+            .context("Failed to decompress reference file")?;
+
+        // 对于引用文件，检查是否需要删除基础存储文件
+        if let Some(base_storage_id) = &entry.base_storage_id {
+            // 检查是否有其他文件（除了当前文件）仍在引用这个存储
+            let has_other_references = self.has_other_references_to_storage(base_storage_id, &entry.original_path)?;
+            
+            // 如果当前文件有哈希值，更新去重器的引用计数
+            let should_delete_from_dedup = if let Some(hash) = &entry.hash {
+                self.deduplicator.remove_hash_reference(hash)
+            } else {
+                false
+            };
+            
+            // 只有当没有其他引用且去重器也认为应该删除时才删除物理文件
+            if !has_other_references && should_delete_from_dedup && entry.stored_path.exists() {
+                fs::remove_file(&entry.stored_path)
+                    .context("Failed to remove stored file")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 提取差分文件
+    fn extract_delta_file(&mut self, entry: &FileEntry) -> Result<()> {
+        // 获取基础文件ID
+        let base_storage_id = entry.base_storage_id.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Delta file missing base storage ID"))?;
+
+        // 查找基础文件
+        let base_entry = self.find_file_by_storage_id(base_storage_id)?
+            .ok_or_else(|| anyhow::anyhow!("Base file not found for delta: {}", base_storage_id))?;
+
+        // 读取基础文件内容
+        let base_content = self.read_stored_file_content(&base_entry)?;
+
+        // 读取差分数据
+        let delta_data = self.read_stored_file_content(entry)?;
+
+        // 应用差分重建原文件
+        let reconstructed_content = self.delta_storage.apply_delta(&base_content, &delta_data)?;
+
+        // 确保输出目录存在
+        if let Some(parent) = entry.original_path.parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create output directory")?;
+        }
+
+        // 写入重建的文件
+        fs::write(&entry.original_path, reconstructed_content)
+            .context("Failed to write reconstructed file")?;
+
+        // 删除差分存储文件
+        if entry.stored_path.exists() {
+            fs::remove_file(&entry.stored_path)
+                .context("Failed to remove delta file")?;
+        }
+
+        Ok(())
+    }
+
+    /// 根据存储ID查找文件
+    fn find_file_by_storage_id(&self, storage_id: &str) -> Result<Option<FileEntry>> {
+        let all_files = self.index.list_files()?;
+        for file in all_files {
+            if file.id == storage_id {
+                return Ok(Some(file));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 从现有索引重建去重器状态
+    fn rebuild_dedup_state(&mut self) -> Result<()> {
+        let all_files = self.index.list_files()?;
+        let mut dedup_entries = Vec::new();
+
+        for file in all_files {
+            if let Some(hash) = &file.hash {
+                // 只有基础文件（非引用、非差分）才需要注册到去重器
+                if !file.is_reference.unwrap_or(false) && !file.is_delta.unwrap_or(false) {
+                    // 计算引用计数（包括自己）
+                    let ref_count = self.count_references_for_hash(hash)?;
+                    dedup_entries.push((file.id.clone(), hash.clone(), ref_count));
+                }
+            }
+        }
+
+        self.deduplicator.rebuild_from_index(dedup_entries)?;
+        Ok(())
+    }
+
+    /// 计算特定哈希值的引用计数
+    fn count_references_for_hash(&self, target_hash: &str) -> Result<u32> {
+        let all_files = self.index.list_files()?;
+        let mut count = 0;
+
+        for file in all_files {
+            if let Some(hash) = &file.hash {
+                if hash == target_hash {
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// 检查是否有其他文件引用指定的存储ID
+    fn has_references_to_storage(&self, storage_id: &str) -> Result<bool> {
+        let all_files = self.index.list_files()?;
+        
+        for file in all_files {
+            // 检查引用文件
+            if file.is_reference.unwrap_or(false) {
+                if let Some(base_id) = &file.base_storage_id {
+                    if base_id == storage_id {
+                        return Ok(true);
+                    }
+                }
+            }
+            
+            // 检查差分文件
+            if file.is_delta.unwrap_or(false) {
+                if let Some(base_id) = &file.base_storage_id {
+                    if base_id == storage_id {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        
+        Ok(false)
+    }
+
+    /// 检查是否有其他文件（除了指定文件）引用指定的存储ID
+    fn has_other_references_to_storage(&self, storage_id: &str, exclude_path: &Path) -> Result<bool> {
+        let all_files = self.index.list_files()?;
+        
+        for file in all_files {
+            // 跳过指定要排除的文件
+            if file.original_path == exclude_path {
+                continue;
+            }
+            
+            // 检查引用文件
+            if file.is_reference.unwrap_or(false) {
+                if let Some(base_id) = &file.base_storage_id {
+                    if base_id == storage_id {
+                        return Ok(true);
+                    }
+                }
+            }
+            
+            // 检查差分文件
+            if file.is_delta.unwrap_or(false) {
+                if let Some(base_id) = &file.base_storage_id {
+                    if base_id == storage_id {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        
+        Ok(false)
     }
 }

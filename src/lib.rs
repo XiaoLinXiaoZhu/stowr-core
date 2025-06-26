@@ -42,10 +42,14 @@
 pub mod config;
 pub mod storage;
 pub mod index;
+pub mod dedup;
+pub mod delta;
 
-pub use config::{Config, IndexMode};
+pub use config::{Config, IndexMode, CompressionAlgorithm, DeltaAlgorithm};
 pub use storage::StorageManager;
 pub use index::{FileEntry, IndexStore, create_index};
+pub use dedup::{ContentDeduplicator, DedupInfo, DedupStats};
+pub use delta::{DeltaStorage, DeltaInfo, SimilarityMatch, DeltaStats};
 
 // Re-export commonly used types
 pub use anyhow::Result;
